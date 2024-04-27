@@ -1,58 +1,67 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const os = std.os;
+const posix = std.posix;
 const fs = std.fs;
 const time = std.time;
 const ascii = std.ascii;
 
-fn handler_ctrlc(sig: i32, info: *const os.siginfo_t, ctx_ptr: ?*const anyopaque) callconv(.C) void {
+fn handler_ctrlc(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*const anyopaque) callconv(.C) void {
     _ = ctx_ptr;
     _ = info;
     _ = sig;
     std.debug.print("CTRL-C\n", .{});
-    os.abort();
+    posix.abort();
 }
 
-fn configTty(stdin: *const fs.File) !os.termios {
-    const oldconf = try os.tcgetattr(stdin.handle);
+fn configTty(stdin: *const fs.File) !posix.termios {
+    const oldconf = try posix.tcgetattr(stdin.handle);
     var termios = oldconf;
-    switch (builtin.target.os.tag) {
-        .linux => {
-            termios.lflag &= ~(os.linux.ECHO | os.linux.ECHONL | os.linux.ICANON);
-            termios.lflag |= (os.linux.ISIG);
-        },
-        .macos => {
-            termios.lflag &= ~(os.darwin.ECHO | os.darwin.ECHONL | os.darwin.ICANON | os.linux.IEXTEN);
-            termios.lflag |= (os.darwin.ISIG);
-        },
-        else => @compileError("TTY is not supported for this platform"),
-    }
-    try os.tcsetattr(stdin.handle, os.TCSA.NOW, termios);
+    termios.lflag.ECHO = false;
+    termios.lflag.ECHONL = false;
+    termios.lflag.ICANON = false;
+    termios.lflag.IEXTEN = false;
+    termios.lflag.ISIG = true;
+    try posix.tcsetattr(stdin.handle, posix.TCSA.NOW, termios);
     return oldconf;
 }
 
-pub fn console() !void {
+pub fn consoleInitStdin(stdin: fs.File) !u32 {
+    _ = stdin;
+    return 0;
+}
+
+pub fn consoleInitStdout(stdout: fs.File) !u32 {
+    _ = stdout;
+    return 0;
+}
+
+pub fn consoleDeinit(stdfile: fs.File, oldmode: u32) void {
+    _ = stdfile;
+    _ = oldmode;
+}
+
+pub fn console(stdin: fs.File) !void {
     switch (builtin.target.os.tag) {
         .linux, .macos => {
-            var sa = os.Sigaction{
+            var sa = posix.Sigaction{
                 .handler = .{ .sigaction = &handler_ctrlc },
-                .mask = os.empty_sigset,
-                .flags = os.SA.SIGINFO,
+                .mask = posix.empty_sigset,
+                .flags = posix.SA.SIGINFO,
             };
-            try os.sigaction(os.SIG.INT, &sa, null);
+            try posix.sigaction(posix.SIG.INT, &sa, null);
         },
         else => @compileError("CTRL-C is not supported for this platform"),
     }
 
-    const stdin = std.io.getStdIn();
     var stdin_stream = stdin.reader();
-    var oldtermios: os.termios = undefined;
+    var oldtermios: posix.termios = undefined;
     if (stdin.isTty()) {
         std.debug.print("stdin is TTY\n", .{});
         oldtermios = try configTty(&stdin);
     }
     defer if (stdin.isTty()) {
-        os.tcsetattr(stdin.handle, os.TCSA.NOW, oldtermios) catch |err| {
+        posix.tcsetattr(stdin.handle, posix.TCSA.NOW, oldtermios) catch |err| {
             std.debug.print("TTY could not be restored: {!}\n", .{err});
         };
     };

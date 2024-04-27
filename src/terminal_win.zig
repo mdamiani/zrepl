@@ -180,7 +180,7 @@ fn ctrlHandler(fdwCtrlType: win.DWORD) callconv(win.WINAPI) win.BOOL {
 }
 
 fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
-    var irArr: [16]kernel32.INPUT_RECORD = undefined;
+    const irArr: [16]kernel32.INPUT_RECORD = undefined;
     _ = irArr;
     var dwLen: win.DWORD = undefined;
     var evt: win.DWORD = undefined;

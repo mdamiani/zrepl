@@ -5,8 +5,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const module = b.addModule("zrepl", .{
-        .source_file = .{ .path = "src/repl.zig" },
-        .dependencies = &.{},
+        .root_source_file = .{ .path = "src/repl.zig" },
+        .target = target,
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{
@@ -16,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.addModule("zrepl", module);
+    exe.root_module.addImport("zrepl", module);
 
     b.installArtifact(exe);
 
