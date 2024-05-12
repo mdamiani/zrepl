@@ -5,6 +5,10 @@ const posix = std.posix;
 const fs = std.fs;
 const time = std.time;
 const ascii = std.ascii;
+const Allocator = std.mem.Allocator;
+
+pub const SigState = posix.Sigaction;
+pub const TermState = posix.termios;
 
 fn handler_ctrlc(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*const anyopaque) callconv(.C) void {
     _ = ctx_ptr;
@@ -26,51 +30,46 @@ fn configTty(stdin: *const fs.File) !posix.termios {
     return oldconf;
 }
 
-pub fn consoleInitStdin(stdin: fs.File) !u32 {
-    _ = stdin;
-    return 0;
+pub fn consoleCtrlcInit() !posix.Sigaction {
+    var oldstate: posix.Sigaction = undefined;
+    var sa = posix.Sigaction{
+        .handler = .{ .sigaction = &handler_ctrlc },
+        .mask = posix.empty_sigset,
+        .flags = posix.SA.SIGINFO,
+    };
+    try posix.sigaction(posix.SIG.INT, &sa, &oldstate);
+    return oldstate;
 }
 
-pub fn consoleInitStdout(stdout: fs.File) !u32 {
-    _ = stdout;
-    return 0;
+pub fn consoleCtrlcDeinit(oldstate: posix.Sigaction) !void {
+    try posix.sigaction(posix.SIG.INT, &oldstate, null);
 }
 
-pub fn consoleDeinit(stdfile: fs.File, oldmode: u32) void {
+pub fn consoleStdinInit(stdin: fs.File) !posix.termios {
+    return try configTty(&stdin);
+}
+
+pub fn consoleStdinDeinit(stdfile: fs.File, oldmode: posix.termios) !void {
     _ = stdfile;
     _ = oldmode;
 }
 
-pub fn console(stdin: fs.File) !void {
-    switch (builtin.target.os.tag) {
-        .linux, .macos => {
-            var sa = posix.Sigaction{
-                .handler = .{ .sigaction = &handler_ctrlc },
-                .mask = posix.empty_sigset,
-                .flags = posix.SA.SIGINFO,
-            };
-            try posix.sigaction(posix.SIG.INT, &sa, null);
-        },
-        else => @compileError("CTRL-C is not supported for this platform"),
-    }
+pub fn consoleStdoutInit(stdout: fs.File) !posix.termios {
+    _ = stdout;
+    const ret: posix.termios = undefined;
+    return ret;
+}
 
-    var stdin_stream = stdin.reader();
-    var oldtermios: posix.termios = undefined;
-    if (stdin.isTty()) {
-        std.debug.print("stdin is TTY\n", .{});
-        oldtermios = try configTty(&stdin);
-    }
-    defer if (stdin.isTty()) {
-        posix.tcsetattr(stdin.handle, posix.TCSA.NOW, oldtermios) catch |err| {
-            std.debug.print("TTY could not be restored: {!}\n", .{err});
-        };
-    };
+pub fn consoleStoudDeinit(stdfile: fs.File, oldmode: posix.termios) !void {
+    _ = stdfile;
+    _ = oldmode;
+}
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
+pub fn console(allocator: Allocator, stdin: fs.File) !void {
     var line = std.ArrayList(u8).init(allocator);
     defer line.deinit();
+
+    var stdin_stream = stdin.reader();
 
     std.debug.print("> ", .{});
     while (true) {

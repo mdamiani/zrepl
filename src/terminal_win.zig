@@ -181,7 +181,6 @@ fn ctrlHandler(fdwCtrlType: win.DWORD) callconv(win.WINAPI) win.BOOL {
 
 fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
     const irArr: [16]kernel32.INPUT_RECORD = undefined;
-    _ = irArr;
     var dwLen: win.DWORD = undefined;
     var evt: win.DWORD = undefined;
     var h: [2]win.HANDLE = undefined;
@@ -202,56 +201,55 @@ fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
             return error.PipeErr;
         }
 
-        //const recCnt = try PeekConsoleInput(hin, irArr[0..]);
-        //if (recCnt == 0) {
-        //    continue;
-        //}
-
-        //var keyDownFound = false;
-
-        //for (0..recCnt) |i| {
-        //    const ir = &irArr[i];
-
-        //    if (ir.EventType != kernel32.KEY_EVENT) {
-        //        var drop: [1]kernel32.INPUT_RECORD = undefined;
-        //        _ = try ReadConsoleInput(hin, drop[0..1]);
-        //        continue;
-        //    }
-
-        //    const pKey: *kernel32.KEY_EVENT_RECORD = @ptrCast(&ir.Event);
-
-        //    if (pKey.bKeyDown == 0) {
-        //        var drop: [1]kernel32.INPUT_RECORD = undefined;
-        //        _ = try ReadConsoleInput(hin, drop[0..1]);
-        //        continue;
-        //    }
-
-        //    switch (pKey.uChar.AsciiChar) {
-        //        0x03,
-        //        0x04,
-        //        0x07...0x0D,
-        //        0x1B,
-        //        0x20...0x7F,
-        //        => {
-        //            keyDownFound = true;
-        //            break;
-        //        },
-        //        else => {
-        //            var drop: [1]kernel32.INPUT_RECORD = undefined;
-        //            _ = try ReadConsoleInput(hin, drop[0..1]);
-        //            continue;
-        //        },
-        //    }
-        //}
-
-        //if (keyDownFound) {
-        var mybuf: [8]u8 = undefined;
-        //const n = try ReadConsole(hin, mybuf[0..1]);
-        const n = try win.ReadFile(hin, mybuf[0..1], null, .blocking);
-        if (n > 0) {
-            std.debug.print("> {s} 0x{c} ({d})\n", .{ mybuf[0..n], std.fmt.fmtSliceHexUpper(mybuf[0..n]), n });
+        const recCnt = try PeekConsoleInput(hin, irArr[0..]);
+        if (recCnt == 0) {
+            continue;
         }
-        //}
+
+        var keyDownFound = false;
+
+        for (0..recCnt) |i| {
+            const ir = &irArr[i];
+
+            if (ir.EventType != kernel32.KEY_EVENT) {
+                var drop: [1]kernel32.INPUT_RECORD = undefined;
+                _ = try ReadConsoleInput(hin, drop[0..1]);
+                continue;
+            }
+
+            const pKey: *kernel32.KEY_EVENT_RECORD = @ptrCast(&ir.Event);
+
+            if (pKey.bKeyDown == 0) {
+                var drop: [1]kernel32.INPUT_RECORD = undefined;
+                _ = try ReadConsoleInput(hin, drop[0..1]);
+                continue;
+            }
+
+            switch (pKey.uChar.AsciiChar) {
+                0x03,
+                0x04,
+                0x07...0x0D,
+                0x1B,
+                0x20...0x7F,
+                => {
+                    keyDownFound = true;
+                    break;
+                },
+                else => {
+                    var drop: [1]kernel32.INPUT_RECORD = undefined;
+                    _ = try ReadConsoleInput(hin, drop[0..1]);
+                    continue;
+                },
+            }
+        }
+
+        if (keyDownFound) {
+            var mybuf: [8]u8 = undefined;
+            const n = try ReadConsole(hin, mybuf[0..1]);
+            if (n > 0) {
+                std.debug.print("> {s} 0x{c} ({d})\n", .{ mybuf[0..n], std.fmt.fmtSliceHexUpper(mybuf[0..n]), n });
+            }
+        }
     }
 
     buf[dwLen] = 0;

@@ -4,6 +4,7 @@ const os = std.os;
 const fs = std.fs;
 const time = std.time;
 const ascii = std.ascii;
+const Allocator = std.mem.Allocator;
 
 const term =
     switch (builtin.os.tag) {
@@ -14,35 +15,93 @@ const term =
 
 const Self = @This();
 
+const OldMode = struct {
+    termStdin: term.TermState,
+    termStdout: term.TermState,
+    sigState: term.SigState,
+};
+
+allocator: std.mem.Allocator,
 stdin: fs.File = undefined,
 stdout: fs.File = undefined,
+ctrlc: bool,
 
-oldModeStdin: u32 = undefined,
-oldModeStdout: u32 = undefined,
+oldMode: OldMode = undefined,
 
-pub fn init(stdin: fs.File, stdout: fs.File) !Self {
+pub fn init(allocator: Allocator, stdin: fs.File, stdout: fs.File, ctrlc: bool) !Self {
     var self = Self{
+        .allocator = allocator,
         .stdin = stdin,
         .stdout = stdout,
+        .ctrlc = ctrlc,
     };
+
     if (stdin.isTty()) {
-        self.oldModeStdin = try term.consoleInitStdin(stdin);
+        self.oldMode.termStdin = try term.consoleStdinInit(stdin);
     }
+    errdefer if (stdin.isTty()) {
+        term.consoleStdinDeinit(stdin, self.oldMode.termStdin) catch |err| {
+            std.log.warn("could not restore console stdin: {!}\n", .{err});
+        };
+    };
+
     if (stdout.isTty()) {
-        self.oldModeStdout = try term.consoleInitStdout(stdout);
+        self.oldMode.termStdout = try term.consoleStdoutInit(stdout);
     }
+    errdefer if (stdout.isTty()) {
+        term.consoleStoudDeinit(stdout, self.oldMode.termStdout) catch |err| {
+            std.log.warn("could not restore console stdout: {!}\n", .{err});
+        };
+    };
+
+    if (ctrlc) {
+        self.oldMode.sigState = try term.consoleCtrlcInit();
+    }
+
     return self;
 }
 
 pub fn deinit(self: Self) void {
     if (self.stdin.isTty()) {
-        term.consoleDeinit(self.stdin, self.oldModeStdin);
+        term.consoleStdinDeinit(self.stdin, self.oldMode.termStdin) catch |err| {
+            std.log.warn("could not restore console stdin: {!}\n", .{err});
+        };
     }
     if (self.stdout.isTty()) {
-        term.consoleDeinit(self.stdout, self.oldModeStdout);
+        term.consoleStdinDeinit(self.stdout, self.oldMode.termStdout) catch |err| {
+            std.log.warn("could not restore console stdout: {!}\n", .{err});
+        };
+    }
+    if (self.ctrlc) {
+        term.consoleCtrlcDeinit(self.oldMode.sigState) catch |err| {
+            std.log.warn("could not restore ctrl-c handler: {!}\n", .{err});
+        };
     }
 }
 
 pub fn do_repl(self: Self) !void {
-    try term.console(self.stdin);
+    if (self.stdin.isTty()) {
+        try term.console(self.allocator, self.stdin);
+    } else {
+        try self.consume_stdin();
+    }
+}
+
+fn consume_stdin(self: Self) !void {
+    var stdin_buffered_reader = std.io.bufferedReader(self.stdin.reader());
+    var stdin_stream = stdin_buffered_reader.reader();
+
+    const input = stdin_stream.readUntilDelimiterOrEofAlloc(
+        self.allocator,
+        ';',
+        std.math.maxInt(usize),
+    ) catch |err| {
+        return err;
+    } orelse {
+        // EOF.
+        return;
+    };
+
+    // parse input
+    _ = input;
 }
