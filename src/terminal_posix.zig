@@ -1,106 +1,102 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const os = std.os;
 const posix = std.posix;
 const fs = std.fs;
 const time = std.time;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 
-pub const SigState = posix.Sigaction;
-pub const TermState = posix.termios;
+const Self = @This();
+
+const OldMode = struct {
+    termStdin: posix.termios,
+    termStdout: posix.termios,
+    sigState: posix.Sigaction,
+};
+
+var ctrlcFdW: posix.fd_t = undefined;
+ctrlcFdR: posix.fd_t = undefined,
+oldMode: OldMode = undefined,
 
 fn handler_ctrlc(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*const anyopaque) callconv(.C) void {
     _ = ctx_ptr;
     _ = info;
     _ = sig;
-    std.debug.print("CTRL-C\n", .{});
-    posix.abort();
+    const n = posix.write(ctrlcFdW, &[1]u8{'1'}) catch |err| {
+        std.log.err("could not notify CTRL-C signal: {!}, aborting...\n", .{err});
+        posix.abort();
+    };
+    if (n != 1) {
+        std.log.err("could not notify CTRL-C signal: invalid write, aborting...\n", .{});
+        posix.abort();
+    }
 }
 
-fn configTty(stdin: *const fs.File) !posix.termios {
-    const oldconf = try posix.tcgetattr(stdin.handle);
-    var termios = oldconf;
+pub fn consoleCtrlcInit(self: *Self) !void {
+    self.ctrlcFdR, ctrlcFdW = try posix.pipe();
+
+    var sa = posix.Sigaction{
+        .handler = .{ .sigaction = &handler_ctrlc },
+        .mask = posix.empty_sigset,
+        .flags = posix.SA.SIGINFO,
+    };
+    try posix.sigaction(posix.SIG.INT, &sa, &self.oldMode.sigState);
+}
+
+pub fn consoleCtrlcDeinit(self: *Self) !void {
+    try posix.sigaction(posix.SIG.INT, &self.oldMode.sigState, null);
+
+    posix.close(ctrlcFdW);
+    posix.close(self.ctrlcFdR);
+}
+
+pub fn consoleStdinInit(self: *Self, stdin: fs.File) !void {
+    self.oldMode.termStdin = try posix.tcgetattr(stdin.handle);
+    var termios = self.oldMode.termStdin;
     termios.lflag.ECHO = false;
     termios.lflag.ECHONL = false;
     termios.lflag.ICANON = false;
     termios.lflag.IEXTEN = false;
     termios.lflag.ISIG = true;
     try posix.tcsetattr(stdin.handle, posix.TCSA.NOW, termios);
-    return oldconf;
 }
 
-pub fn consoleCtrlcInit() !posix.Sigaction {
-    var oldstate: posix.Sigaction = undefined;
-    var sa = posix.Sigaction{
-        .handler = .{ .sigaction = &handler_ctrlc },
-        .mask = posix.empty_sigset,
-        .flags = posix.SA.SIGINFO,
-    };
-    try posix.sigaction(posix.SIG.INT, &sa, &oldstate);
-    return oldstate;
+pub fn consoleStdinDeinit(self: *Self, stdin: fs.File) !void {
+    try posix.tcsetattr(stdin.handle, posix.TCSA.NOW, self.oldMode.termStdin);
 }
 
-pub fn consoleCtrlcDeinit(oldstate: posix.Sigaction) !void {
-    try posix.sigaction(posix.SIG.INT, &oldstate, null);
-}
-
-pub fn consoleStdinInit(stdin: fs.File) !posix.termios {
-    return try configTty(&stdin);
-}
-
-pub fn consoleStdinDeinit(stdfile: fs.File, oldmode: posix.termios) !void {
-    _ = stdfile;
-    _ = oldmode;
-}
-
-pub fn consoleStdoutInit(stdout: fs.File) !posix.termios {
+pub fn consoleStdoutInit(self: *Self, stdout: fs.File) !void {
+    _ = self;
     _ = stdout;
-    const ret: posix.termios = undefined;
-    return ret;
 }
 
-pub fn consoleStoudDeinit(stdfile: fs.File, oldmode: posix.termios) !void {
-    _ = stdfile;
-    _ = oldmode;
+pub fn consoleStdoutDeinit(self: *Self, stdout: fs.File) !void {
+    _ = self;
+    _ = stdout;
 }
 
-pub fn console(allocator: Allocator, stdin: fs.File) !void {
-    var line = std.ArrayList(u8).init(allocator);
-    defer line.deinit();
+pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
+    var poller = std.io.poll(allocator, enum { stdin, ctrlc }, .{
+        .stdin = stdin,
+        .ctrlc = ctrlc,
+    });
+    defer poller.deinit();
 
-    var stdin_stream = stdin.reader();
+    const pollStdin = poller.fifo(.stdin);
+    const pollCtrlc = poller.fifo(.ctrlc);
 
-    std.debug.print("> ", .{});
     while (true) {
-        const c: u8 = stdin_stream.readByte() catch |err| {
-            if (err == error.EndOfStream) {
-                // EOF.
-                std.debug.print("\nExiting.\n", .{});
-                return;
-            } else {
-                std.debug.print("caught err: {!}\n", .{err});
-                return err;
-            }
-        };
-        switch (c) {
-            '\n' => {
-                std.debug.print("{s}\n", .{line.items});
-                std.debug.print("> ", .{});
-                line.clearAndFree();
-            },
-            ascii.control_code.bs, ascii.control_code.del => {
-                if (line.popOrNull()) |_| {
-                    std.debug.print("{c} {c}", .{
-                        ascii.control_code.bs,
-                        ascii.control_code.bs,
-                    });
-                }
-            },
-            else => {
-                try line.append(c);
-                std.debug.print("{c}", .{c});
-            },
+        if (!(try poller.poll())) {
+            continue;
+        }
+
+        if (pollCtrlc.readableLength() > 0) {
+            return error.SigInt;
+        } else if (pollStdin.readableLength() > 0) {
+            const c: u8 = pollStdin.readItem() orelse 0;
+            return c;
+        } else {
+            unreachable;
         }
     }
 }

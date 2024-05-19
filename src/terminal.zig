@@ -6,7 +6,7 @@ const time = std.time;
 const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 
-const term =
+const ConsoleImpl =
     switch (builtin.os.tag) {
     .windows => @import("terminal_win.zig"),
     .linux, .macos => @import("terminal_posix.zig"),
@@ -15,18 +15,12 @@ const term =
 
 const Self = @This();
 
-const OldMode = struct {
-    termStdin: term.TermState,
-    termStdout: term.TermState,
-    sigState: term.SigState,
-};
-
 allocator: std.mem.Allocator,
 stdin: fs.File = undefined,
 stdout: fs.File = undefined,
 ctrlc: bool,
 
-oldMode: OldMode = undefined,
+impl: ConsoleImpl = undefined,
 
 pub fn init(allocator: Allocator, stdin: fs.File, stdout: fs.File, ctrlc: bool) !Self {
     var self = Self{
@@ -34,54 +28,81 @@ pub fn init(allocator: Allocator, stdin: fs.File, stdout: fs.File, ctrlc: bool) 
         .stdin = stdin,
         .stdout = stdout,
         .ctrlc = ctrlc,
+        .impl = ConsoleImpl{},
     };
 
     if (stdin.isTty()) {
-        self.oldMode.termStdin = try term.consoleStdinInit(stdin);
+        try self.impl.consoleStdinInit(stdin);
     }
     errdefer if (stdin.isTty()) {
-        term.consoleStdinDeinit(stdin, self.oldMode.termStdin) catch |err| {
+        self.impl.consoleStdinDeinit(stdin) catch |err| {
             std.log.warn("could not restore console stdin: {!}\n", .{err});
         };
     };
 
     if (stdout.isTty()) {
-        self.oldMode.termStdout = try term.consoleStdoutInit(stdout);
+        try self.impl.consoleStdoutInit(stdout);
     }
     errdefer if (stdout.isTty()) {
-        term.consoleStoudDeinit(stdout, self.oldMode.termStdout) catch |err| {
+        self.impl.consoleStdoutDeinit(stdout) catch |err| {
             std.log.warn("could not restore console stdout: {!}\n", .{err});
         };
     };
 
     if (ctrlc) {
-        self.oldMode.sigState = try term.consoleCtrlcInit();
+        try self.impl.consoleCtrlcInit();
     }
 
     return self;
 }
 
-pub fn deinit(self: Self) void {
+pub fn deinit(self: *Self) void {
     if (self.stdin.isTty()) {
-        term.consoleStdinDeinit(self.stdin, self.oldMode.termStdin) catch |err| {
+        self.impl.consoleStdinDeinit(self.stdin) catch |err| {
             std.log.warn("could not restore console stdin: {!}\n", .{err});
         };
     }
     if (self.stdout.isTty()) {
-        term.consoleStdinDeinit(self.stdout, self.oldMode.termStdout) catch |err| {
+        self.impl.consoleStdoutDeinit(self.stdout) catch |err| {
             std.log.warn("could not restore console stdout: {!}\n", .{err});
         };
     }
     if (self.ctrlc) {
-        term.consoleCtrlcDeinit(self.oldMode.sigState) catch |err| {
+        self.impl.consoleCtrlcDeinit() catch |err| {
             std.log.warn("could not restore ctrl-c handler: {!}\n", .{err});
         };
     }
 }
 
-pub fn do_repl(self: Self) !void {
+pub fn do_repl(self: *Self) !void {
     if (self.stdin.isTty()) {
-        try term.console(self.allocator, self.stdin);
+        const ctrlcFileR = std.fs.File{ .handle = self.impl.ctrlcFdR };
+        var line = std.ArrayList(u8).init(self.allocator);
+        defer line.deinit();
+
+        std.debug.print("> ", .{});
+        while (true) {
+            const c = try ConsoleImpl.readChar(self.allocator, self.stdin, ctrlcFileR);
+            switch (c) {
+                '\n' => {
+                    std.debug.print("\n: {s}\n", .{line.items});
+                    std.debug.print("> ", .{});
+                    line.clearAndFree();
+                },
+                ascii.control_code.bs, ascii.control_code.del => {
+                    if (line.popOrNull()) |_| {
+                        std.debug.print("{c} {c}", .{
+                            ascii.control_code.bs,
+                            ascii.control_code.bs,
+                        });
+                    }
+                },
+                else => {
+                    try line.append(c);
+                    std.debug.print("{c}", .{c});
+                },
+            }
+        }
     } else {
         try self.consume_stdin();
     }

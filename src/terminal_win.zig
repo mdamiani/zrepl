@@ -163,22 +163,6 @@ pub fn SetEvent(hEvent: win.HANDLE) !void {
     }
 }
 
-var ctrlcEvent: win.HANDLE = undefined;
-
-fn ctrlHandler(fdwCtrlType: win.DWORD) callconv(win.WINAPI) win.BOOL {
-    switch (fdwCtrlType) {
-        win.CTRL_C_EVENT => {
-            SetEvent(ctrlcEvent) catch {
-                os.abort();
-            };
-            return win.TRUE;
-        },
-        else => {
-            return win.FALSE;
-        },
-    }
-}
-
 fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
     const irArr: [16]kernel32.INPUT_RECORD = undefined;
     var dwLen: win.DWORD = undefined;
@@ -256,13 +240,51 @@ fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
     return dwLen;
 }
 
-pub fn consoleInitStdin(stdin: fs.File) !u32 {
-    var oldmode: win.DWORD = undefined;
-    if (win.kernel32.GetConsoleMode(stdin.handle, &oldmode) == 0) {
+const Self = @This();
+
+const OldMode = struct {
+    termStdin: posix.termios,
+    termStdout: posix.termios,
+    sigState: posix.Sigaction,
+};
+
+var ctrlcEvent: win.HANDLE = undefined;
+oldMode: OldMode = undefined,
+
+fn ctrlHandler(fdwCtrlType: win.DWORD) callconv(win.WINAPI) win.BOOL {
+    switch (fdwCtrlType) {
+        win.CTRL_C_EVENT => {
+            SetEvent(ctrlcEvent) catch {
+                os.abort();
+            };
+            return win.TRUE;
+        },
+        else => {
+            return win.FALSE;
+        },
+    }
+}
+
+pub fn consoleCtrlcInit(self: *Self) !void {
+    _ = self;
+
+    ctrlcEvent = try win.CreateEventEx(null, "CTRLCEvent", 0, win.EVENT_ALL_ACCESS);
+
+    try os.windows.SetConsoleCtrlHandler(ctrlHandler, true);
+}
+
+pub fn consoleCtrlcDeinit(self: *Self) !void {
+    _ = self;
+
+    win.CloseHandle(ctrlcEvent);
+}
+
+pub fn consoleStdinInit(self: *Self, stdin: fs.File) !void {
+    if (win.kernel32.GetConsoleMode(stdin.handle, &self.oldMode.termStdin) == 0) {
         return win.unexpectedError(win.kernel32.GetLastError());
     }
 
-    const mode = (oldmode &
+    const mode = (self.oldMode.termStdin &
         ~(@as(win.DWORD, 0) |
         kernel32.ENABLE_ECHO_INPUT |
         kernel32.ENABLE_INSERT_MODE |
@@ -275,17 +297,18 @@ pub fn consoleInitStdin(stdin: fs.File) !u32 {
 
     try SetConsoleMode(stdin.handle, mode);
     try FlushConsoleInputBuffer(stdin.handle);
-
-    return @as(u32, @intCast(oldmode));
 }
 
-pub fn consoleInitStdout(stdout: fs.File) !u32 {
-    var oldmode: win.DWORD = undefined;
-    if (win.kernel32.GetConsoleMode(stdout.handle, &oldmode) == 0) {
+pub fn consoleStdinDeinit(self: *Self, stdin: fs.File) !void {
+    try SetConsoleMode(stdin.handle, self.oldMode.termStdin);
+}
+
+pub fn consoleStdoutInit(self: *Self, stdout: fs.File) !void {
+    if (win.kernel32.GetConsoleMode(stdout.handle, &self.oldMode.termStdout) == 0) {
         return win.unexpectedError(win.kernel32.GetLastError());
     }
 
-    const mode = (oldmode &
+    const mode = (self.oldMode.termStdout &
         ~(@as(win.DWORD, 0) |
         kernel32.ENABLE_PROCESSED_OUTPUT |
         kernel32.ENABLE_WRAP_AT_EOL_OUTPUT |
@@ -294,28 +317,13 @@ pub fn consoleInitStdout(stdout: fs.File) !u32 {
         kernel32.ENABLE_LVB_GRID_WORLDWIDE));
 
     try SetConsoleMode(stdout.handle, mode);
-
-    return @as(u32, @intCast(oldmode));
 }
 
-pub fn consoleDeinit(stdfile: fs.File, oldmode: u32) void {
-    SetConsoleMode(stdfile.handle, oldmode) catch unreachable;
+pub fn consoleStdoutDeinit(self: *Self, stdout: fs.File) !void {
+    try SetConsoleMode(stdout.handle, self.oldMode.termStdout);
 }
 
 pub fn console(stdin: fs.File) !void {
-    var rp: win.HANDLE = undefined;
-    var wp: win.HANDLE = undefined;
-    var sattr = win.SECURITY_ATTRIBUTES{
-        .nLength = @sizeOf(win.SECURITY_ATTRIBUTES),
-        .bInheritHandle = win.FALSE,
-        .lpSecurityDescriptor = null,
-    };
-    try win.CreatePipe(&rp, &wp, &sattr);
-
-    ctrlcEvent = try win.CreateEventEx(null, "CTRLCEvent", 0, win.EVENT_ALL_ACCESS);
-    defer win.CloseHandle(ctrlcEvent);
-
-    try os.windows.SetConsoleCtrlHandler(ctrlHandler, true);
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -336,4 +344,78 @@ pub fn console(stdin: fs.File) !void {
         std.debug.print("stdin got: {s}, #{d}\n", .{ buf[0..(n + 1)], n });
     }
     std.debug.print("Exiting\n", .{});
+}
+
+pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
+    const irArr: [16]kernel32.INPUT_RECORD = undefined;
+    var dwLen: win.DWORD = undefined;
+    var evt: win.DWORD = undefined;
+    const h = [2]win.HANDLE{stdin.handle, ctrlc.handle};
+
+    // read characters until we reach buffer size
+    dwLen = 0;
+    while (dwLen < buf.len) {
+        // wait for input or until event is signaled
+        std.debug.print("waiting..\n", .{});
+        evt = try win.WaitForMultipleObjectsEx(h[0..], false, win.INFINITE, false);
+        std.debug.print("done!\n", .{});
+
+        // if not STD_INPUT_HANDLE, exit
+        if (evt != 0) {
+            return error.PipeErr;
+        }
+
+        const recCnt = try PeekConsoleInput(hin, irArr[0..]);
+        if (recCnt == 0) {
+            continue;
+        }
+
+        var keyDownFound = false;
+
+        for (0..recCnt) |i| {
+            const ir = &irArr[i];
+
+            if (ir.EventType != kernel32.KEY_EVENT) {
+                var drop: [1]kernel32.INPUT_RECORD = undefined;
+                _ = try ReadConsoleInput(hin, drop[0..1]);
+                continue;
+            }
+
+            const pKey: *kernel32.KEY_EVENT_RECORD = @ptrCast(&ir.Event);
+
+            if (pKey.bKeyDown == 0) {
+                var drop: [1]kernel32.INPUT_RECORD = undefined;
+                _ = try ReadConsoleInput(hin, drop[0..1]);
+                continue;
+            }
+
+            switch (pKey.uChar.AsciiChar) {
+                0x03,
+                0x04,
+                0x07...0x0D,
+                0x1B,
+                0x20...0x7F,
+                => {
+                    keyDownFound = true;
+                    break;
+                },
+                else => {
+                    var drop: [1]kernel32.INPUT_RECORD = undefined;
+                    _ = try ReadConsoleInput(hin, drop[0..1]);
+                    continue;
+                },
+            }
+        }
+
+        if (keyDownFound) {
+            var mybuf: [8]u8 = undefined;
+            const n = try ReadConsole(hin, mybuf[0..1]);
+            if (n > 0) {
+                std.debug.print("> {s} 0x{c} ({d})\n", .{ mybuf[0..n], std.fmt.fmtSliceHexUpper(mybuf[0..n]), n });
+            }
+        }
+    }
+
+    buf[dwLen] = 0;
+    return dwLen;
 }
