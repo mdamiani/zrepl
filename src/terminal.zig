@@ -76,13 +76,12 @@ pub fn deinit(self: *Self) void {
 
 pub fn do_repl(self: *Self) !void {
     if (self.stdin.isTty()) {
-        const ctrlcFileR = std.fs.File{ .handle = self.impl.ctrlcFdR };
         var line = std.ArrayList(u8).init(self.allocator);
         defer line.deinit();
 
         std.debug.print("> ", .{});
         while (true) {
-            const c = try ConsoleImpl.readChar(self.allocator, self.stdin, ctrlcFileR);
+            const c = try ConsoleImpl.readChar(self.allocator, self.stdin, self.ctrlc);
             switch (c) {
                 '\n' => {
                     std.debug.print("\n: {s}\n", .{line.items});

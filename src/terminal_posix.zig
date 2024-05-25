@@ -14,8 +14,8 @@ const OldMode = struct {
     sigState: posix.Sigaction,
 };
 
-var ctrlcFdW: posix.fd_t = undefined;
-ctrlcFdR: posix.fd_t = undefined,
+var ctrlcFdW: posix.fd_t = -1;
+var ctrlcFdR: posix.fd_t = -1;
 oldMode: OldMode = undefined,
 
 fn handler_ctrlc(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*const anyopaque) callconv(.C) void {
@@ -33,7 +33,10 @@ fn handler_ctrlc(sig: i32, info: *const posix.siginfo_t, ctx_ptr: ?*const anyopa
 }
 
 pub fn consoleCtrlcInit(self: *Self) !void {
-    self.ctrlcFdR, ctrlcFdW = try posix.pipe();
+    if (ctrlcFdR != -1 or ctrlcFdW != -1) {
+        return error.MultipleSigIntHandlers;
+    }
+    ctrlcFdR, ctrlcFdW = try posix.pipe();
 
     var sa = posix.Sigaction{
         .handler = .{ .sigaction = &handler_ctrlc },
@@ -47,7 +50,7 @@ pub fn consoleCtrlcDeinit(self: *Self) !void {
     try posix.sigaction(posix.SIG.INT, &self.oldMode.sigState, null);
 
     posix.close(ctrlcFdW);
-    posix.close(self.ctrlcFdR);
+    posix.close(ctrlcFdR);
 }
 
 pub fn consoleStdinInit(self: *Self, stdin: fs.File) !void {
@@ -75,28 +78,32 @@ pub fn consoleStdoutDeinit(self: *Self, stdout: fs.File) !void {
     _ = stdout;
 }
 
-pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
-    var poller = std.io.poll(allocator, enum { stdin, ctrlc }, .{
-        .stdin = stdin,
-        .ctrlc = ctrlc,
-    });
-    defer poller.deinit();
+pub fn readChar(allocator: Allocator, stdin: fs.File, isCtrlc: bool) !u8 {
+    if (isCtrlc) {
+        var poller = std.io.poll(allocator, enum { stdin, ctrlc }, .{
+            .stdin = stdin,
+            .ctrlc = std.fs.File{ .handle = ctrlcFdR },
+        });
+        defer poller.deinit();
 
-    const pollStdin = poller.fifo(.stdin);
-    const pollCtrlc = poller.fifo(.ctrlc);
+        const pollStdin = poller.fifo(.stdin);
+        const pollCtrlc = poller.fifo(.ctrlc);
 
-    while (true) {
-        if (!(try poller.poll())) {
-            continue;
+        while (true) {
+            if (!(try poller.poll())) {
+                continue;
+            }
+
+            if (pollCtrlc.readableLength() > 0) {
+                return error.SigInt;
+            } else if (pollStdin.readableLength() > 0) {
+                const c: u8 = pollStdin.readItem() orelse unreachable;
+                return c;
+            } else {
+                unreachable;
+            }
         }
-
-        if (pollCtrlc.readableLength() > 0) {
-            return error.SigInt;
-        } else if (pollStdin.readableLength() > 0) {
-            const c: u8 = pollStdin.readItem() orelse 0;
-            return c;
-        } else {
-            unreachable;
-        }
+    } else {
+        return stdin.reader().readByte();
     }
 }

@@ -147,7 +147,7 @@ pub fn ReadConsoleInput(hConsoleInput: win.HANDLE, lpBuffer: []kernel32.INPUT_RE
 pub fn ReadConsole(hConsoleInput: win.HANDLE, lpBuffer: []u8) !usize {
     // TODO: may be WCHAR as well?
     const numChars: win.DWORD = @as(win.DWORD, @intCast(@divTrunc(lpBuffer.len, @sizeOf(win.CHAR))));
-    var n: usize = undefined;
+    var n: win.DWORD = undefined;
     if (numChars <= 0) {
         return error.ReadConsoleBufferTooShort;
     }
@@ -163,89 +163,11 @@ pub fn SetEvent(hEvent: win.HANDLE) !void {
     }
 }
 
-fn ReadStdIn(buf: []u8, hin: win.HANDLE, hPipe: win.HANDLE) !win.DWORD {
-    const irArr: [16]kernel32.INPUT_RECORD = undefined;
-    var dwLen: win.DWORD = undefined;
-    var evt: win.DWORD = undefined;
-    var h: [2]win.HANDLE = undefined;
-
-    h[0] = hin;
-    h[1] = hPipe;
-
-    // read characters until we reach buffer size
-    dwLen = 0;
-    while (dwLen < buf.len) {
-        // wait for input or until event is signaled
-        std.debug.print("waiting..\n", .{});
-        evt = try win.WaitForMultipleObjectsEx(h[0..], false, win.INFINITE, false);
-        std.debug.print("done!\n", .{});
-
-        // if not STD_INPUT_HANDLE, exit
-        if (evt != 0) {
-            return error.PipeErr;
-        }
-
-        const recCnt = try PeekConsoleInput(hin, irArr[0..]);
-        if (recCnt == 0) {
-            continue;
-        }
-
-        var keyDownFound = false;
-
-        for (0..recCnt) |i| {
-            const ir = &irArr[i];
-
-            if (ir.EventType != kernel32.KEY_EVENT) {
-                var drop: [1]kernel32.INPUT_RECORD = undefined;
-                _ = try ReadConsoleInput(hin, drop[0..1]);
-                continue;
-            }
-
-            const pKey: *kernel32.KEY_EVENT_RECORD = @ptrCast(&ir.Event);
-
-            if (pKey.bKeyDown == 0) {
-                var drop: [1]kernel32.INPUT_RECORD = undefined;
-                _ = try ReadConsoleInput(hin, drop[0..1]);
-                continue;
-            }
-
-            switch (pKey.uChar.AsciiChar) {
-                0x03,
-                0x04,
-                0x07...0x0D,
-                0x1B,
-                0x20...0x7F,
-                => {
-                    keyDownFound = true;
-                    break;
-                },
-                else => {
-                    var drop: [1]kernel32.INPUT_RECORD = undefined;
-                    _ = try ReadConsoleInput(hin, drop[0..1]);
-                    continue;
-                },
-            }
-        }
-
-        if (keyDownFound) {
-            var mybuf: [8]u8 = undefined;
-            const n = try ReadConsole(hin, mybuf[0..1]);
-            if (n > 0) {
-                std.debug.print("> {s} 0x{c} ({d})\n", .{ mybuf[0..n], std.fmt.fmtSliceHexUpper(mybuf[0..n]), n });
-            }
-        }
-    }
-
-    buf[dwLen] = 0;
-    return dwLen;
-}
-
 const Self = @This();
 
 const OldMode = struct {
-    termStdin: posix.termios,
-    termStdout: posix.termios,
-    sigState: posix.Sigaction,
+    termStdin: win.DWORD,
+    termStdout: win.DWORD,
 };
 
 var ctrlcEvent: win.HANDLE = undefined;
@@ -255,7 +177,7 @@ fn ctrlHandler(fdwCtrlType: win.DWORD) callconv(win.WINAPI) win.BOOL {
     switch (fdwCtrlType) {
         win.CTRL_C_EVENT => {
             SetEvent(ctrlcEvent) catch {
-                os.abort();
+                @panic("SetEvent failed!");
             };
             return win.TRUE;
         },
@@ -269,13 +191,13 @@ pub fn consoleCtrlcInit(self: *Self) !void {
     _ = self;
 
     ctrlcEvent = try win.CreateEventEx(null, "CTRLCEvent", 0, win.EVENT_ALL_ACCESS);
-
     try os.windows.SetConsoleCtrlHandler(ctrlHandler, true);
 }
 
 pub fn consoleCtrlcDeinit(self: *Self) !void {
     _ = self;
 
+    try os.windows.SetConsoleCtrlHandler(ctrlHandler, false);
     win.CloseHandle(ctrlcEvent);
 }
 
@@ -323,49 +245,31 @@ pub fn consoleStdoutDeinit(self: *Self, stdout: fs.File) !void {
     try SetConsoleMode(stdout.handle, self.oldMode.termStdout);
 }
 
-pub fn console(stdin: fs.File) !void {
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    var line = std.ArrayList(u8).init(allocator);
-    defer line.deinit();
-
-    std.debug.print("> ", .{});
-    var buf = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
-    while (true) {
-        std.debug.print("stdin waiting...\n", .{});
-        const n = ReadStdIn(buf[0..], stdin.handle, ctrlcEvent) catch |err| {
-            if (err == error.PipeErr) {
-                std.debug.print("CTRL-C\n", .{});
-            }
-            return err;
-        };
-        std.debug.print("stdin got: {s}, #{d}\n", .{ buf[0..(n + 1)], n });
-    }
-    std.debug.print("Exiting\n", .{});
+fn dropConsoleInput(stdin: fs.File) !void {
+    var drop: [1]kernel32.INPUT_RECORD = undefined;
+    _ = try ReadConsoleInput(stdin.handle, drop[0..1]);
 }
 
-pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
-    const irArr: [16]kernel32.INPUT_RECORD = undefined;
-    var dwLen: win.DWORD = undefined;
-    var evt: win.DWORD = undefined;
-    const h = [2]win.HANDLE{stdin.handle, ctrlc.handle};
+pub fn readChar(allocator: Allocator, stdin: fs.File, isCtrlc: bool) !u8 {
+    _ = allocator;
+    const hLen = x: {
+        var len: usize = 1;
+        if (isCtrlc) len = len + 1;
+        break :x len;
+    };
 
-    // read characters until we reach buffer size
-    dwLen = 0;
-    while (dwLen < buf.len) {
+    while (true) {
         // wait for input or until event is signaled
-        std.debug.print("waiting..\n", .{});
-        evt = try win.WaitForMultipleObjectsEx(h[0..], false, win.INFINITE, false);
-        std.debug.print("done!\n", .{});
+        const h = [2]win.HANDLE{ stdin.handle, ctrlcEvent };
+        const evt = try win.WaitForMultipleObjectsEx(h[0..hLen], false, win.INFINITE, false);
 
-        // if not STD_INPUT_HANDLE, exit
+        // if not stdin, then exit
         if (evt != 0) {
-            return error.PipeErr;
+            return error.SigInt;
         }
 
-        const recCnt = try PeekConsoleInput(hin, irArr[0..]);
+        var irArr: [16]kernel32.INPUT_RECORD = undefined;
+        const recCnt = try PeekConsoleInput(stdin.handle, irArr[0..]);
         if (recCnt == 0) {
             continue;
         }
@@ -376,16 +280,14 @@ pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
             const ir = &irArr[i];
 
             if (ir.EventType != kernel32.KEY_EVENT) {
-                var drop: [1]kernel32.INPUT_RECORD = undefined;
-                _ = try ReadConsoleInput(hin, drop[0..1]);
+                try dropConsoleInput(stdin);
                 continue;
             }
 
             const pKey: *kernel32.KEY_EVENT_RECORD = @ptrCast(&ir.Event);
 
             if (pKey.bKeyDown == 0) {
-                var drop: [1]kernel32.INPUT_RECORD = undefined;
-                _ = try ReadConsoleInput(hin, drop[0..1]);
+                try dropConsoleInput(stdin);
                 continue;
             }
 
@@ -400,22 +302,18 @@ pub fn readChar(allocator: Allocator, stdin: fs.File, ctrlc: fs.File) !u8 {
                     break;
                 },
                 else => {
-                    var drop: [1]kernel32.INPUT_RECORD = undefined;
-                    _ = try ReadConsoleInput(hin, drop[0..1]);
+                    try dropConsoleInput(stdin);
                     continue;
                 },
             }
         }
 
         if (keyDownFound) {
-            var mybuf: [8]u8 = undefined;
-            const n = try ReadConsole(hin, mybuf[0..1]);
+            var mybuf: [1]u8 = undefined;
+            const n = try ReadConsole(stdin.handle, mybuf[0..1]);
             if (n > 0) {
-                std.debug.print("> {s} 0x{c} ({d})\n", .{ mybuf[0..n], std.fmt.fmtSliceHexUpper(mybuf[0..n]), n });
+                return mybuf[0];
             }
         }
     }
-
-    buf[dwLen] = 0;
-    return dwLen;
 }
