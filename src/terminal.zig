@@ -84,7 +84,12 @@ pub fn do_repl(self: *Self) !void {
             const c = try ConsoleImpl.readChar(self.allocator, self.stdin, self.ctrlc);
             switch (c) {
                 '\n' => {
-                    std.debug.print("\n: {s}\n", .{line.items});
+                    var it = std.mem.splitSequence(u8, line.items, ";");
+                    std.debug.print("\n: {s}", .{std.mem.trim(u8, it.first(), " ")});
+                    while (it.next()) |next| {
+                        std.debug.print("\n: {s}", .{std.mem.trim(u8, next, " ")});
+                    }
+                    std.debug.print("\n", .{});
                     std.debug.print("> ", .{});
                     line.clearAndFree();
                 },
